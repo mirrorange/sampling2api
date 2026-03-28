@@ -8,13 +8,13 @@
 **Goal**: Implement the shared peer registry and non-streaming `/v1/messages` bridge backed by MCP sampling over stdio.
 **Success Criteria**: A connected MCP client can initialize, register, and serve non-streaming Anthropic-compatible requests via HTTP.
 **Tests**: `cargo test stdio_bridge`
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 3: Streamable HTTP Bridge
 **Goal**: Add Streamable HTTP MCP transport support and session-aware peer selection for the Messages API.
 **Success Criteria**: The service can host `/mcp` and `/v1/messages` together, register HTTP MCP sessions, and route requests to the correct peer.
 **Tests**: `cargo test http_bridge`
-**Status**: Not Started
+**Status**: In Progress
 
 ## Stage 4: Streaming and Polish
 **Goal**: Convert completed MCP sampling responses into Anthropic-style SSE event streams and finalize CLI/documentation.

@@ -84,8 +84,8 @@ pub fn sampling_result_to_messages_response(
 
     Ok(MessagesResponse {
         id: id.into(),
-        object_type: "message",
-        role: "assistant",
+        object_type: "message".to_string(),
+        role: "assistant".to_string(),
         content,
         model: result.model,
         stop_reason: result.stop_reason.as_deref().map(map_stop_reason),

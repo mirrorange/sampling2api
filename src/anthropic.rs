@@ -158,8 +158,8 @@ pub enum ToolChoice {
 pub struct MessagesResponse {
     pub id: String,
     #[serde(rename = "type")]
-    pub object_type: &'static str,
-    pub role: &'static str,
+    pub object_type: String,
+    pub role: String,
     pub content: Vec<OutputContentBlock>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
