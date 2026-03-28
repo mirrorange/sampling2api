@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use sampling2api::runtime::{run_http_bridge, run_stdio_bridge};
+use tracing::Level;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -31,7 +32,10 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
         .with_target(false)
+        .with_max_level(Level::WARN)
         .compact()
         .init();
 
