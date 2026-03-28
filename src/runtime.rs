@@ -12,7 +12,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -23,23 +23,29 @@ use rmcp::{
         ClientCapabilities, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
         Implementation, SamplingMessage,
     },
+    transport::StreamableHttpClientTransport,
 };
 use rmcp::{
     ErrorData as McpError, Peer, RoleServer, ServerHandler, ServiceExt,
     model::{InitializeRequestParams, ServerCapabilities, ServerInfo},
     service::{NotificationContext, RequestContext, ServiceError},
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 use serde::Serialize;
 use tokio::{net::TcpListener, sync::RwLock};
 
 use crate::{
-    anthropic::{MessagesRequest, MessagesResponse},
+    anthropic::MessagesRequest,
     conversion::{messages_request_to_sampling, sampling_result_to_messages_response},
     error::BridgeError,
+    streaming::{messages_response_to_json_response, messages_response_to_sse_response},
 };
 
 pub const DEFAULT_STDIO_SESSION_KEY: &str = "stdio";
-pub const SESSION_HEADER: &str = "x-mcp-session-id";
+pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
+pub const API_SESSION_HEADER: &str = "x-mcp-session-id";
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -104,8 +110,40 @@ impl PeerRegistry {
                 .expect("peer exists when len is 1")
                 .clone()),
             _ => Err(ApiError::invalid_request(format!(
-                "multiple MCP client sessions are connected; set the '{SESSION_HEADER}' header"
+                "multiple MCP client sessions are connected; set the '{API_SESSION_HEADER}' header"
             ))),
+        }
+    }
+
+    #[cfg(test)]
+    async fn keys(&self) -> Vec<String> {
+        let mut keys = self.inner.read().await.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+}
+
+#[derive(Clone)]
+enum RegistrationStrategy {
+    Fixed(String),
+    HttpSessionHeader,
+}
+
+impl RegistrationStrategy {
+    fn session_key_from_request(&self, context: &RequestContext<RoleServer>) -> Option<String> {
+        match self {
+            Self::Fixed(key) => Some(key.clone()),
+            Self::HttpSessionHeader => session_key_from_extensions(&context.extensions),
+        }
+    }
+
+    fn session_key_from_notification(
+        &self,
+        context: &NotificationContext<RoleServer>,
+    ) -> Option<String> {
+        match self {
+            Self::Fixed(key) => Some(key.clone()),
+            Self::HttpSessionHeader => session_key_from_extensions(&context.extensions),
         }
     }
 }
@@ -113,44 +151,24 @@ impl PeerRegistry {
 #[derive(Clone)]
 pub struct SamplingBridgeServer {
     registry: PeerRegistry,
-    fixed_session_key: String,
+    registration_strategy: RegistrationStrategy,
 }
 
 impl SamplingBridgeServer {
     pub fn stdio(registry: PeerRegistry) -> Self {
         Self {
             registry,
-            fixed_session_key: DEFAULT_STDIO_SESSION_KEY.to_string(),
+            registration_strategy: RegistrationStrategy::Fixed(
+                DEFAULT_STDIO_SESSION_KEY.to_string(),
+            ),
         }
     }
 
-    pub async fn run_stdio_http_bridge(self, listen_addr: SocketAddr) -> anyhow::Result<()> {
-        let state = AppState {
-            peers: self.registry.clone(),
-            ..AppState::default()
-        };
-        let listener = TcpListener::bind(listen_addr)
-            .await
-            .with_context(|| format!("failed to bind HTTP listener on {listen_addr}"))?;
-        let router = state.router();
-
-        let http_task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .await
-                .context("HTTP server exited unexpectedly")
-        });
-
-        let mcp = self
-            .serve((tokio::io::stdin(), tokio::io::stdout()))
-            .await
-            .context("failed to start stdio MCP service")?;
-        mcp.waiting()
-            .await
-            .context("stdio MCP service exited unexpectedly")?;
-
-        http_task.abort();
-        let _ = http_task.await;
-        Ok(())
+    pub fn http(registry: PeerRegistry) -> Self {
+        Self {
+            registry,
+            registration_strategy: RegistrationStrategy::HttpSessionHeader,
+        }
     }
 }
 
@@ -169,7 +187,9 @@ impl ServerHandler for SamplingBridgeServer {
     {
         let registry = self.registry.clone();
         let peer = context.peer.clone();
-        let session_key = self.fixed_session_key.clone();
+        let session_key = self
+            .registration_strategy
+            .session_key_from_request(&context);
         let should_set_peer_info = peer.peer_info().is_none();
         let server_info = self.get_info();
 
@@ -177,7 +197,9 @@ impl ServerHandler for SamplingBridgeServer {
             if should_set_peer_info {
                 peer.set_peer_info(request);
             }
-            registry.register(session_key, peer).await;
+            if let Some(session_key) = session_key {
+                registry.register(session_key, peer).await;
+            }
             Ok(server_info)
         }
     }
@@ -188,12 +210,75 @@ impl ServerHandler for SamplingBridgeServer {
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
         let registry = self.registry.clone();
         let peer = context.peer.clone();
-        let session_key = self.fixed_session_key.clone();
+        let session_key = self
+            .registration_strategy
+            .session_key_from_notification(&context);
 
         async move {
-            registry.register(session_key, peer).await;
+            if let Some(session_key) = session_key {
+                registry.register(session_key, peer).await;
+            }
         }
     }
+}
+
+pub async fn run_stdio_bridge(listen_addr: SocketAddr) -> anyhow::Result<()> {
+    let state = AppState::new();
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("failed to bind HTTP listener on {listen_addr}"))?;
+    let router = state.router();
+
+    let http_task = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .context("HTTP server exited unexpectedly")
+    });
+
+    let bridge = SamplingBridgeServer::stdio(state.peers());
+    let mcp = bridge
+        .serve((tokio::io::stdin(), tokio::io::stdout()))
+        .await
+        .context("failed to start stdio MCP service")?;
+    mcp.waiting()
+        .await
+        .context("stdio MCP service exited unexpectedly")?;
+
+    http_task.abort();
+    let _ = http_task.await;
+    Ok(())
+}
+
+pub async fn run_http_bridge(listen_addr: SocketAddr, mcp_path: &str) -> anyhow::Result<()> {
+    let state = AppState::new();
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("failed to bind HTTP listener on {listen_addr}"))?;
+    let router = build_http_router(state, mcp_path);
+
+    axum::serve(listener, router)
+        .await
+        .context("Streamable HTTP bridge exited unexpectedly")?;
+    Ok(())
+}
+
+fn build_http_router(state: AppState, mcp_path: &str) -> Router {
+    let registry = state.peers();
+    let service = StreamableHttpService::new(
+        move || Ok(SamplingBridgeServer::http(registry.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
+    state.router().nest_service(mcp_path, service)
+}
+
+fn session_key_from_extensions(extensions: &rmcp::model::Extensions) -> Option<String> {
+    extensions
+        .get::<Parts>()
+        .and_then(|parts| parts.headers.get(MCP_SESSION_HEADER))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn health_handler() -> &'static str {
@@ -204,21 +289,27 @@ async fn messages_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<MessagesRequest>,
-) -> Result<Json<MessagesResponse>, ApiError> {
-    if request.stream.unwrap_or(false) {
-        return Err(ApiError::unsupported(
-            "stream=true is not available yet in the stdio bridge stage".to_string(),
-        ));
+) -> Response {
+    match messages_handler_inner(state, headers, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
     }
+}
 
+async fn messages_handler_inner(
+    state: AppState,
+    headers: HeaderMap,
+    request: MessagesRequest,
+) -> Result<Response, ApiError> {
     let peer = state
         .peers
         .select(
             headers
-                .get(SESSION_HEADER)
+                .get(API_SESSION_HEADER)
                 .and_then(|value| value.to_str().ok()),
         )
         .await?;
+    let stream = request.stream.unwrap_or(false);
     let params = messages_request_to_sampling(request)?;
     let result = peer
         .create_message(params)
@@ -226,7 +317,11 @@ async fn messages_handler(
         .map_err(ApiError::from_service_error)?;
     let response = sampling_result_to_messages_response(state.allocate_message_id(), result)?;
 
-    Ok(Json(response))
+    Ok(if stream {
+        messages_response_to_sse_response(response)
+    } else {
+        messages_response_to_json_response(response)
+    })
 }
 
 #[derive(Debug)]
@@ -293,9 +388,9 @@ impl IntoResponse for ApiError {
         (
             self.status,
             Json(ErrorEnvelope {
-                object_type: "error",
+                object_type: "error".to_string(),
                 error: ErrorBody {
-                    error_type: self.error_type,
+                    error_type: self.error_type.to_string(),
                     message: self.message,
                 },
             }),
@@ -307,14 +402,14 @@ impl IntoResponse for ApiError {
 #[derive(Debug, Serialize)]
 struct ErrorEnvelope {
     #[serde(rename = "type")]
-    object_type: &'static str,
+    object_type: String,
     error: ErrorBody,
 }
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     #[serde(rename = "type")]
-    error_type: &'static str,
+    error_type: String,
     message: String,
 }
 
@@ -322,8 +417,12 @@ struct ErrorBody {
 mod tests {
     use std::time::Duration;
 
+    use axum::http::header::CONTENT_TYPE;
+
     use super::*;
-    use crate::anthropic::{MessageContentInput, MessageParam, MessageRole, MessagesRequest};
+    use crate::anthropic::{
+        MessageContentInput, MessageParam, MessageRole, MessagesResponse, OutputContentBlock,
+    };
 
     #[derive(Clone)]
     struct MockSamplingClient;
@@ -345,11 +444,24 @@ mod tests {
                     })
                     .unwrap_or_else(|| "missing prompt".to_string());
 
-                Ok(CreateMessageResult::new(
-                    SamplingMessage::assistant_text(format!("echo: {prompt}")),
-                    "mock-client".to_string(),
-                )
-                .with_stop_reason(CreateMessageResult::STOP_REASON_END_TURN))
+                if prompt == "tool" {
+                    Ok(CreateMessageResult::new(
+                        SamplingMessage::assistant_tool_use(
+                            "toolu_1",
+                            "lookup_weather",
+                            serde_json::from_value(serde_json::json!({"city": "Paris"}))
+                                .expect("object"),
+                        ),
+                        "mock-client".to_string(),
+                    )
+                    .with_stop_reason(CreateMessageResult::STOP_REASON_TOOL_USE))
+                } else {
+                    Ok(CreateMessageResult::new(
+                        SamplingMessage::assistant_text(format!("echo: {prompt}")),
+                        "mock-client".to_string(),
+                    )
+                    .with_stop_reason(CreateMessageResult::STOP_REASON_END_TURN))
+                }
             }
         }
 
@@ -420,7 +532,7 @@ mod tests {
         assert_eq!(body.stop_reason.as_deref(), Some("end_turn"));
         assert!(matches!(
             body.content.first(),
-            Some(crate::anthropic::OutputContentBlock::Text { text }) if text == "echo: hello"
+            Some(OutputContentBlock::Text { text }) if text == "echo: hello"
         ));
 
         client.cancel().await.expect("client should cancel");
@@ -430,12 +542,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdio_bridge_rejects_stream_requests_before_streaming_stage() {
+    async fn streaming_endpoint_returns_anthropic_sse_events() {
         let state = AppState::new();
-        let response = messages_handler(
-            State(state),
-            HeaderMap::new(),
-            Json(MessagesRequest {
+        let router = state.router();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr available");
+
+        let http_task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("HTTP server should run");
+        });
+
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let bridge = SamplingBridgeServer::stdio(state.peers());
+        let server_task = tokio::spawn(async move {
+            let server = bridge
+                .serve(server_transport)
+                .await
+                .expect("server should start");
+            server.waiting().await.expect("server should stop cleanly");
+        });
+
+        let client = MockSamplingClient
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .json(&MessagesRequest {
                 model: "claude-sonnet-4-0".to_string(),
                 max_tokens: 64,
                 messages: vec![MessageParam {
@@ -449,12 +588,103 @@ mod tests {
                 tools: None,
                 tool_choice: None,
                 stream: Some(true),
-            }),
-        )
-        .await
-        .expect_err("streaming should be rejected before stage 4");
+            })
+            .send()
+            .await
+            .expect("request should succeed");
 
-        assert_eq!(response.status, StatusCode::BAD_REQUEST);
-        assert!(response.message.contains("stream=true"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        );
+
+        let body = response.text().await.expect("SSE body");
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: content_block_delta"));
+        assert!(body.contains("event: message_stop"));
+        assert!(body.contains("\"text_delta\""));
+
+        client.cancel().await.expect("client should cancel");
+        server_task.await.expect("server task join");
+        http_task.abort();
+        let _ = http_task.await;
+    }
+
+    #[tokio::test]
+    async fn http_bridge_registers_session_and_routes_by_header() {
+        let state = AppState::new();
+        let router = build_http_router(state.clone(), "/mcp");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr available");
+
+        let http_task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("HTTP server should run");
+        });
+
+        let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
+        let client = MockSamplingClient
+            .serve(transport)
+            .await
+            .expect("streamable HTTP client should connect");
+
+        let session_key = wait_for_http_session_key(&state)
+            .await
+            .expect("session should register");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header(API_SESSION_HEADER, &session_key)
+            .json(&MessagesRequest {
+                model: "claude-sonnet-4-0".to_string(),
+                max_tokens: 64,
+                messages: vec![MessageParam {
+                    role: MessageRole::User,
+                    content: MessageContentInput::String("hello".to_string()),
+                }],
+                system: None,
+                metadata: None,
+                stop_sequences: None,
+                temperature: None,
+                tools: None,
+                tool_choice: None,
+                stream: Some(false),
+            })
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: MessagesResponse = response.json().await.expect("valid response body");
+        assert!(matches!(
+            body.content.first(),
+            Some(OutputContentBlock::Text { text }) if text == "echo: hello"
+        ));
+
+        client.cancel().await.expect("client should cancel");
+        http_task.abort();
+        let _ = http_task.await;
+    }
+
+    async fn wait_for_http_session_key(state: &AppState) -> Option<String> {
+        for _ in 0..20 {
+            let keys = state.peers().keys().await;
+            if let Some(key) = keys
+                .into_iter()
+                .find(|key| key != DEFAULT_STDIO_SESSION_KEY)
+            {
+                return Some(key);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        None
     }
 }

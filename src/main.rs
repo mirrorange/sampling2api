@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use sampling2api::runtime::{AppState, SamplingBridgeServer};
+use sampling2api::runtime::{run_http_bridge, run_stdio_bridge};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,6 +20,12 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:38080")]
         listen: SocketAddr,
     },
+    Http {
+        #[arg(long, default_value = "127.0.0.1:38080")]
+        listen: SocketAddr,
+        #[arg(long, default_value = "/mcp")]
+        mcp_path: String,
+    },
 }
 
 #[tokio::main]
@@ -33,12 +39,16 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Stdio { listen } => {
-            let state = AppState::new();
-            let bridge = SamplingBridgeServer::stdio(state.peers());
-            bridge
-                .run_stdio_http_bridge(listen)
+            run_stdio_bridge(listen)
                 .await
                 .with_context(|| format!("stdio bridge failed while serving {listen}"))?;
+        }
+        Command::Http { listen, mcp_path } => {
+            run_http_bridge(listen, &mcp_path).await.with_context(|| {
+                format!(
+                    "streamable HTTP bridge failed while serving {listen} with MCP path {mcp_path}"
+                )
+            })?;
         }
     }
 

@@ -1400,6 +1400,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rand 0.10.0",
+ "reqwest",
  "rmcp-macros",
  "schemars",
  "serde",
