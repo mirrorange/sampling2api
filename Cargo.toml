@@ -2,6 +2,16 @@
 name = "sampling2api"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["mirrorange"]
+description = "Expose MCP client sampling as an Anthropic-compatible Messages API"
+readme = "README.md"
+repository = "https://github.com/mirrorange/sampling2api"
+homepage = "https://github.com/mirrorange/sampling2api"
+license = "MIT"
+keywords = ["mcp", "anthropic", "sampling", "api", "bridge"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+exclude = [".vscode/", "AGENTS.md", "docs/", "target/"]
 
 [dependencies]
 anyhow = "1.0.102"
