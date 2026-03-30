@@ -22,7 +22,7 @@ pub async fn messages_request_to_sampling(
     let MessagesRequest {
         model,
         max_tokens,
-        messages,
+        mut messages,
         system,
         metadata,
         stop_sequences,
@@ -31,6 +31,10 @@ pub async fn messages_request_to_sampling(
         tool_choice,
         stream: _,
     } = request;
+
+    if let Some(tool_name) = required_tool_name(&tool_choice) {
+        append_required_tool_hint(&mut messages, tool_name);
+    }
 
     let mut sampling_messages = Vec::with_capacity(messages.len());
     for message in messages {
@@ -236,16 +240,51 @@ fn tool_choice_to_mcp(tool_choice: ToolChoice) -> Result<McpToolChoice, BridgeEr
         ToolChoice::Auto => ToolChoiceMode::Auto,
         ToolChoice::Any => ToolChoiceMode::Required,
         ToolChoice::None => ToolChoiceMode::None,
-        ToolChoice::Tool { name } => {
-            return Err(BridgeError::UnsupportedAnthropicFeature(format!(
-                "specific tool choice '{name}' cannot be represented by MCP sampling"
-            )));
-        }
+        ToolChoice::Tool { .. } => ToolChoiceMode::Required,
     };
 
     let mut tool_choice = McpToolChoice::default();
     tool_choice.mode = Some(mode);
     Ok(tool_choice)
+}
+
+fn required_tool_name(tool_choice: &Option<ToolChoice>) -> Option<&str> {
+    match tool_choice {
+        Some(ToolChoice::Tool { name }) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn append_required_tool_hint(messages: &mut [MessageParam], tool_name: &str) {
+    let Some(message) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+    else {
+        return;
+    };
+
+    let hint = format!("(Please call the {tool_name} tool.)");
+    match &mut message.content {
+        MessageContentInput::String(text) => append_hint_to_text(text, &hint),
+        MessageContentInput::Blocks(blocks) => append_hint_to_blocks(blocks, hint),
+    }
+}
+
+fn append_hint_to_text(text: &mut String, hint: &str) {
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str(hint);
+}
+
+fn append_hint_to_blocks(blocks: &mut Vec<InputContentBlock>, hint: String) {
+    if let Some(InputContentBlock::Text { text }) = blocks.last_mut() {
+        append_hint_to_text(text, &hint);
+        return;
+    }
+
+    blocks.push(InputContentBlock::Text { text: hint });
 }
 
 fn output_content_block_from_sampling(
@@ -460,7 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_request_rejects_specific_tool_choice() {
+    async fn protocol_request_maps_specific_tool_choice_to_required_mode_with_hint() {
         let request = MessagesRequest {
             model: "claude".to_string(),
             max_tokens: 16,
@@ -479,14 +518,91 @@ mod tests {
             stream: None,
         };
 
-        let error = messages_request_to_sampling(request)
+        let params = messages_request_to_sampling(request)
             .await
-            .expect_err("request should fail");
-        assert!(matches!(
-            error,
-            BridgeError::UnsupportedAnthropicFeature(message)
-                if message.contains("specific tool choice")
-        ));
+            .expect("request should convert");
+
+        assert_eq!(
+            params
+                .tool_choice
+                .as_ref()
+                .and_then(|choice| choice.mode.clone()),
+            Some(ToolChoiceMode::Required)
+        );
+        assert_eq!(params.messages.len(), 1);
+        assert_eq!(params.messages[0].role, Role::User);
+        let contents = params.messages[0].content.iter().collect::<Vec<_>>();
+        assert_eq!(contents.len(), 1);
+        match contents[0] {
+            SamplingMessageContent::Text(text) => {
+                assert_eq!(text.text, "hello (Please call the only_this tool.)");
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_request_appends_specific_tool_choice_hint_to_last_user_text_block() {
+        let request = MessagesRequest {
+            model: "claude".to_string(),
+            max_tokens: 32,
+            messages: vec![
+                MessageParam {
+                    role: MessageRole::User,
+                    content: MessageContentInput::String("first".to_string()),
+                },
+                MessageParam {
+                    role: MessageRole::Assistant,
+                    content: MessageContentInput::String("working on it".to_string()),
+                },
+                MessageParam {
+                    role: MessageRole::User,
+                    content: MessageContentInput::Blocks(vec![
+                        InputContentBlock::Image {
+                            source: ImageSource::Base64 {
+                                media_type: "image/png".to_string(),
+                                data: "abc123".to_string(),
+                            },
+                        },
+                        InputContentBlock::Text {
+                            text: "Describe this image".to_string(),
+                        },
+                    ]),
+                },
+            ],
+            system: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            tools: Some(vec![ToolDefinition {
+                name: "describe_image".to_string(),
+                description: None,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "detail": { "type": "string" } }
+                }),
+            }]),
+            tool_choice: Some(ToolChoice::Tool {
+                name: "describe_image".to_string(),
+            }),
+            stream: None,
+        };
+
+        let params = messages_request_to_sampling(request)
+            .await
+            .expect("request should convert");
+
+        let contents = params.messages[2].content.iter().collect::<Vec<_>>();
+        assert_eq!(contents.len(), 2);
+        match contents[1] {
+            SamplingMessageContent::Text(text) => {
+                assert_eq!(
+                    text.text,
+                    "Describe this image (Please call the describe_image tool.)"
+                );
+            }
+            other => panic!("expected trailing text content, got {other:?}"),
+        }
     }
 
     #[test]
