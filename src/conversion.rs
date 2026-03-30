@@ -1,5 +1,6 @@
 use std::{borrow::Cow, sync::Arc};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::model::{
     Content, CreateMessageRequestParams, CreateMessageResult, ModelHint, ModelPreferences,
     RawImageContent, Role, SamplingMessage, SamplingMessageContent, Tool,
@@ -9,44 +10,53 @@ use serde_json::{Map, Value};
 
 use crate::{
     anthropic::{
-        InputContentBlock, MessageContentInput, MessageParam, MessageRole, MessagesRequest,
-        MessagesResponse, OutputContentBlock, ToolChoice, ToolDefinition, Usage,
+        ImageSource, InputContentBlock, MessageContentInput, MessageParam, MessageRole,
+        MessagesRequest, MessagesResponse, OutputContentBlock, ToolChoice, ToolDefinition, Usage,
     },
     error::BridgeError,
 };
 
-pub fn messages_request_to_sampling(
+pub async fn messages_request_to_sampling(
     request: MessagesRequest,
 ) -> Result<CreateMessageRequestParams, BridgeError> {
-    let mut params = CreateMessageRequestParams::new(
-        request
-            .messages
-            .into_iter()
-            .map(message_param_to_sampling)
-            .collect::<Result<Vec<_>, _>>()?,
-        request.max_tokens,
-    )
-    .with_model_preferences(
-        ModelPreferences::new().with_hints(vec![ModelHint::new(request.model)]),
-    );
+    let MessagesRequest {
+        model,
+        max_tokens,
+        messages,
+        system,
+        metadata,
+        stop_sequences,
+        temperature,
+        tools,
+        tool_choice,
+        stream: _,
+    } = request;
 
-    if let Some(system) = request.system {
+    let mut sampling_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        sampling_messages.push(message_param_to_sampling(message).await?);
+    }
+
+    let mut params = CreateMessageRequestParams::new(sampling_messages, max_tokens)
+        .with_model_preferences(ModelPreferences::new().with_hints(vec![ModelHint::new(model)]));
+
+    if let Some(system) = system {
         params = params.with_system_prompt(system.flatten_text());
     }
 
-    if let Some(temperature) = request.temperature {
+    if let Some(temperature) = temperature {
         params = params.with_temperature(temperature);
     }
 
-    if let Some(stop_sequences) = request.stop_sequences {
+    if let Some(stop_sequences) = stop_sequences {
         params = params.with_stop_sequences(stop_sequences);
     }
 
-    if let Some(metadata) = request.metadata {
+    if let Some(metadata) = metadata {
         params = params.with_metadata(metadata);
     }
 
-    if let Some(tools) = request.tools {
+    if let Some(tools) = tools {
         params = params.with_tools(
             tools
                 .into_iter()
@@ -55,7 +65,7 @@ pub fn messages_request_to_sampling(
         );
     }
 
-    if let Some(tool_choice) = request.tool_choice {
+    if let Some(tool_choice) = tool_choice {
         params = params.with_tool_choice(tool_choice_to_mcp(tool_choice)?);
     }
 
@@ -94,7 +104,7 @@ pub fn sampling_result_to_messages_response(
     })
 }
 
-fn message_param_to_sampling(message: MessageParam) -> Result<SamplingMessage, BridgeError> {
+async fn message_param_to_sampling(message: MessageParam) -> Result<SamplingMessage, BridgeError> {
     let role = match message.role {
         MessageRole::User => Role::User,
         MessageRole::Assistant => Role::Assistant,
@@ -102,34 +112,24 @@ fn message_param_to_sampling(message: MessageParam) -> Result<SamplingMessage, B
 
     let contents = match message.content {
         MessageContentInput::String(text) => vec![SamplingMessageContent::text(text)],
-        MessageContentInput::Blocks(blocks) => blocks
-            .into_iter()
-            .map(input_block_to_sampling)
-            .collect::<Result<Vec<_>, _>>()?,
+        MessageContentInput::Blocks(blocks) => {
+            let mut contents = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                contents.push(input_block_to_sampling(block).await?);
+            }
+            contents
+        }
     };
 
     Ok(SamplingMessage::new_multiple(role, contents))
 }
 
-fn input_block_to_sampling(
+async fn input_block_to_sampling(
     block: InputContentBlock,
 ) -> Result<SamplingMessageContent, BridgeError> {
     match block {
         InputContentBlock::Text { text } => Ok(SamplingMessageContent::text(text)),
-        InputContentBlock::Image { source } => {
-            if source.source_type != "base64" {
-                return Err(BridgeError::UnsupportedAnthropicFeature(format!(
-                    "unsupported image source type '{}'",
-                    source.source_type
-                )));
-            }
-
-            Ok(SamplingMessageContent::Image(RawImageContent {
-                data: source.data,
-                mime_type: source.media_type,
-                meta: None,
-            }))
-        }
+        InputContentBlock::Image { source } => image_source_to_sampling(source).await,
         InputContentBlock::ToolUse { id, name, input } => Ok(SamplingMessageContent::tool_use(
             id,
             name,
@@ -148,6 +148,77 @@ fn input_block_to_sampling(
             let mut result = rmcp::model::ToolResultContent::new(tool_use_id, content);
             result.is_error = is_error;
             Ok(SamplingMessageContent::ToolResult(result))
+        }
+    }
+}
+
+async fn image_source_to_sampling(
+    source: ImageSource,
+) -> Result<SamplingMessageContent, BridgeError> {
+    match source {
+        ImageSource::Base64 { media_type, data } => {
+            Ok(SamplingMessageContent::Image(RawImageContent {
+                data,
+                mime_type: media_type,
+                meta: None,
+            }))
+        }
+        ImageSource::Url { url, media_type } => {
+            let parsed_url = reqwest::Url::parse(&url).map_err(|error| {
+                BridgeError::InvalidAnthropicRequest(format!("invalid image URL '{url}': {error}"))
+            })?;
+
+            match parsed_url.scheme() {
+                "http" | "https" => {}
+                scheme => {
+                    return Err(BridgeError::InvalidAnthropicRequest(format!(
+                        "unsupported image URL scheme '{scheme}' for '{url}'"
+                    )));
+                }
+            }
+
+            let response = reqwest::get(parsed_url).await.map_err(|error| {
+                BridgeError::InvalidAnthropicRequest(format!(
+                    "failed to download image URL '{url}': {error}"
+                ))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(BridgeError::InvalidAnthropicRequest(format!(
+                    "image URL '{url}' returned HTTP {status}"
+                )));
+            }
+
+            let response_media_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let mime_type = media_type.or(response_media_type).ok_or_else(|| {
+                BridgeError::InvalidAnthropicRequest(format!(
+                    "image URL '{url}' did not provide a media type; set source.media_type explicitly"
+                ))
+            })?;
+            if !mime_type.starts_with("image/") {
+                return Err(BridgeError::InvalidAnthropicRequest(format!(
+                    "image URL '{url}' resolved to non-image media type '{mime_type}'"
+                )));
+            }
+
+            let data = BASE64_STANDARD.encode(response.bytes().await.map_err(|error| {
+                BridgeError::InvalidAnthropicRequest(format!(
+                    "failed to read image bytes from '{url}': {error}"
+                ))
+            })?);
+
+            Ok(SamplingMessageContent::Image(RawImageContent {
+                data,
+                mime_type,
+                meta: None,
+            }))
         }
     }
 }
@@ -220,12 +291,17 @@ fn map_stop_reason(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
     use crate::anthropic::{ImageSource, SystemPrompt, ToolResultContentBlock, ToolResultTextType};
+    use axum::{Router, http::header::CONTENT_TYPE, routing::get};
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
+    use tokio::net::TcpListener;
 
-    #[test]
-    fn protocol_request_maps_to_sampling_with_tools_and_system() {
+    #[tokio::test]
+    async fn protocol_request_maps_to_sampling_with_tools_and_system() {
         let request = MessagesRequest {
             model: "claude-sonnet-4-0".to_string(),
             max_tokens: 256,
@@ -278,7 +354,9 @@ mod tests {
             stream: Some(false),
         };
 
-        let params = messages_request_to_sampling(request).expect("request should convert");
+        let params = messages_request_to_sampling(request)
+            .await
+            .expect("request should convert");
 
         assert_eq!(params.max_tokens, 256);
         assert_eq!(
@@ -306,8 +384,8 @@ mod tests {
         assert_eq!(params.messages.len(), 2);
     }
 
-    #[test]
-    fn protocol_request_supports_text_and_images() {
+    #[tokio::test]
+    async fn protocol_request_supports_text_and_images() {
         let request = MessagesRequest {
             model: "claude".to_string(),
             max_tokens: 32,
@@ -318,8 +396,7 @@ mod tests {
                         text: "Describe this image".to_string(),
                     },
                     InputContentBlock::Image {
-                        source: ImageSource {
-                            source_type: "base64".to_string(),
+                        source: ImageSource::Base64 {
                             media_type: "image/png".to_string(),
                             data: "abc123".to_string(),
                         },
@@ -335,15 +412,55 @@ mod tests {
             stream: None,
         };
 
-        let params = messages_request_to_sampling(request).expect("request should convert");
+        let params = messages_request_to_sampling(request)
+            .await
+            .expect("request should convert");
 
         let contents = params.messages[0].content.iter().collect::<Vec<_>>();
         assert!(matches!(contents[0], SamplingMessageContent::Text(_)));
         assert!(matches!(contents[1], SamplingMessageContent::Image(_)));
     }
 
-    #[test]
-    fn protocol_request_rejects_specific_tool_choice() {
+    #[tokio::test]
+    async fn protocol_request_downloads_url_images_and_converts_to_base64() {
+        let (addr, _server) = spawn_image_server().await;
+        let request = MessagesRequest {
+            model: "claude".to_string(),
+            max_tokens: 32,
+            messages: vec![MessageParam {
+                role: MessageRole::User,
+                content: MessageContentInput::Blocks(vec![InputContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: format!("http://{addr}/image.png"),
+                        media_type: None,
+                    },
+                }]),
+            }],
+            system: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+        };
+
+        let params = messages_request_to_sampling(request)
+            .await
+            .expect("request should convert");
+
+        let contents = params.messages[0].content.iter().collect::<Vec<_>>();
+        match contents[0] {
+            SamplingMessageContent::Image(image) => {
+                assert_eq!(image.mime_type, "image/png");
+                assert_eq!(image.data, BASE64_STANDARD.encode("png-bytes"));
+            }
+            other => panic!("expected image content, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_request_rejects_specific_tool_choice() {
         let request = MessagesRequest {
             model: "claude".to_string(),
             max_tokens: 16,
@@ -362,7 +479,9 @@ mod tests {
             stream: None,
         };
 
-        let error = messages_request_to_sampling(request).expect_err("request should fail");
+        let error = messages_request_to_sampling(request)
+            .await
+            .expect_err("request should fail");
         assert!(matches!(
             error,
             BridgeError::UnsupportedAnthropicFeature(message)
@@ -405,5 +524,23 @@ mod tests {
             response.content[1],
             OutputContentBlock::ToolUse { .. }
         ));
+    }
+
+    async fn spawn_image_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let router = Router::new().route(
+            "/image.png",
+            get(|| async { ([(CONTENT_TYPE, "image/png")], "png-bytes") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr available");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("server should run");
+        });
+
+        (addr, server)
     }
 }

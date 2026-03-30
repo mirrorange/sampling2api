@@ -310,7 +310,7 @@ async fn messages_handler_inner(
         )
         .await?;
     let stream = request.stream.unwrap_or(false);
-    let params = messages_request_to_sampling(request)?;
+    let params = messages_request_to_sampling(request).await?;
     let result = peer
         .create_message(params)
         .await

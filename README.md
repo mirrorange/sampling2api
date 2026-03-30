@@ -33,7 +33,7 @@ In the MCP ecosystem, **Sampling** lets servers request LLM completions from cli
   - **Stdio** — connects to an MCP client over stdin/stdout (ideal for subprocess-based setups)
   - **Streamable HTTP** — connects to an MCP client over HTTP (ideal for remote or multi-client scenarios)
 - **Tool use support** — full round-trip for tool calls, tool results, and multi-turn tool loops
-- **Image support** — base64-encoded image content passthrough
+- **Image support** — base64 image passthrough and URL image download-to-base64 conversion
 - **Multi-session routing** — in HTTP mode, multiple MCP clients can connect simultaneously, routed via the `x-mcp-session-id` header
 - **Health check endpoint** — `GET /health`
 
@@ -128,6 +128,7 @@ Returns `ok` — useful for readiness and liveness probes.
 |---|---|---|
 | Text messages | ✅ | Supported |
 | Image content (base64) | ✅ | Supported |
+| Image content (URL) | ✅ | Downloaded and converted to base64 |
 | System prompt | ✅ | Supported |
 | Tool definitions | ✅ | Supported |
 | Tool use / Tool results | ✅ | Supported |
@@ -169,7 +170,7 @@ Returns `ok` — useful for readiness and liveness probes.
   - **Stdio** — 通过 stdin/stdout 连接 MCP 客户端（适合子进程方式）
   - **Streamable HTTP** — 通过 HTTP 连接 MCP 客户端（适合远程或多客户端场景）
 - **工具调用支持** — 完整的工具调用、工具结果和多轮工具循环
-- **图像支持** — base64 编码的图像内容透传
+- **图像支持** — 支持 base64 图像透传，以及 URL 图像下载后转为 base64
 - **多会话路由** — HTTP 模式下多个 MCP 客户端可同时连接，通过 `x-mcp-session-id` 头进行路由
 - **健康检查端点** — `GET /health`
 
@@ -264,6 +265,7 @@ sampling2api http --listen 127.0.0.1:38080 --mcp-path /mcp
 |---|---|---|
 | 文本消息 | ✅ | 支持 |
 | 图像内容（base64） | ✅ | 支持 |
+| 图像内容（URL） | ✅ | 下载后转换为 base64 |
 | 系统提示词 | ✅ | 支持 |
 | 工具定义 | ✅ | 支持 |
 | 工具调用 / 工具结果 | ✅ | 支持 |
